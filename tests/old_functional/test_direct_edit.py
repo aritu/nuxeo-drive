@@ -316,6 +316,74 @@ class MixinTests(DirectEditSetup):
         # And the error queue should still be be empty, the bad upload has beend discarded
         assert self.direct_edit._error_queue.empty()
 
+    def test_orphan_should_unlock(self):
+        filename = "orphan-test.txt"
+        doc_id = self.remote.make_file("/", filename, content=b"Some content.")
+        local_path = Path(f"{doc_id}_file-content/{filename}")
+        edit_local_path = self.direct_edit._folder / local_path
+
+        def get_locked_paths():
+            """Mocked dao.get_local_paths method."""
+            nonlocal edit_local_path
+
+            return [edit_local_path]
+
+        def orphan_unlocked(_):
+            """Mocked autolock.orphan_unlocked method."""
+            nonlocal orphan_called
+
+            orphan_called = True
+
+        def remote_unlock(_):
+            """Mocked remote.unlock method."""
+            nonlocal remote_called
+
+            remote_called = True
+
+        orphan_called = False
+        remote_called = False
+
+        # Download file
+        self.direct_edit._prepare_edit(self.nuxeo_url, doc_id)
+        assert self.local.exists(local_path)
+        self.wait_sync(timeout=2, fail_if_timeout=False)
+
+        # Orphans download should not be cleaned by _cleanup
+        with patch.object(
+            self.manager_1.dao, "get_locked_paths", new=get_locked_paths
+        ), ensure_no_exception():
+            self.direct_edit._cleanup()
+            assert self.local.exists(local_path)
+
+        with ensure_no_exception():
+            self.direct_edit._autolock_orphans([edit_local_path])
+
+        # ensure that lock queue has been filled with an unlock orphan
+        assert not self.direct_edit._lock_queue.empty()
+        item = self.direct_edit._lock_queue.get_nowait()
+        assert item == (local_path, "unlock_orphan")
+
+        # Re-put elem in lock_queue after check
+        self.direct_edit._lock_queue.put(item)
+
+        orphan_called = False
+        remote_called = False
+
+        with patch.object(
+            self.engine_1.remote, "unlock", new=remote_unlock
+        ), patch.object(
+            self.direct_edit.autolock, "orphan_unlocked", new=orphan_unlocked
+        ), ensure_no_exception():
+            self.direct_edit._handle_lock_queue()
+            # lock queue should be empty
+            assert self.direct_edit._lock_queue.empty()
+
+        assert orphan_called
+        assert remote_called
+
+        # ensure that the file has been cleaned
+        assert not self.local.exists(local_path)
+
     def test_direct_edit_version(self):
         from nuxeo.models import BufferBlob
 
